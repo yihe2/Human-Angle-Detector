@@ -1,21 +1,41 @@
 import cv2
-import numpy as np
 import mediapipe as mp
+import numpy as np
+from collections import deque
+import time
 
+# --- CONFIGURATION VARIABLES ---
+# 1. Smoothing: How many frames to average? (Higher = Smoother but slower response)
+SMOOTHING_WINDOW = 15
 
-# 1. Initialize MediaPipe Pose
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
+# 2. Deadband: Minimum angle change required to trigger a move (Degrees)
+# If the change is less than this, the machine stays still.
+MOVEMENT_THRESHOLD = 3.0
 
-# 2. Hook up to the laptop camera (0 is usually the default webcam)
-cap = cv2.VideoCapture(0)
-
-# Standard laptop webcam Horizontal Field of View (in degrees)
-# Adjust this if your camera has a wider/narrower lens.
+# 3. Camera Field of View (Standard Webcam)
 HFOV = 88.0
 
-print("Press 'q' to quit.")
+# --- SETUP ---
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5
+)
+mp_drawing = mp.solutions.drawing_utils
+
+# Initialize buffer for smoothing
+angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
+
+# State variables
+current_motor_angle = 0.0  # Where the machine is currently pointing
+last_command_time = 0
+
+cap = cv2.VideoCapture(0)
+
+print("---------------------------------------")
+print("  BASKETBALL TRACKING SYSTEM STARTED   ")
+print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
+print(f"  Deadband:  {MOVEMENT_THRESHOLD} degrees")
+print("---------------------------------------")
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -23,75 +43,92 @@ while cap.isOpened():
         print("Ignoring empty camera frame.")
         continue
 
-    # Get frame dimensions
     h, w, _ = frame.shape
     center_x = w // 2
 
-    # Convert the BGR image to RGB (MediaPipe requires RGB)
+    # Process Image
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     image.flags.writeable = False
-
-    # 3. Process the image to find the human body
     results = pose.process(image)
-
-    # Convert back to BGR for OpenCV display
     image.flags.writeable = True
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-    # Draw the center line of the camera view
+    # Draw Center Reference
     cv2.line(image, (center_x, 0), (center_x, h), (255, 255, 255), 1)
-    cv2.putText(
-        image,
-        "0 deg (Center)",
-        (center_x - 50, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (255, 255, 255),
-        1,
-    )
 
     if results.pose_landmarks:
-        # Draw the skeleton on the image
         mp_drawing.draw_landmarks(
             image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
         )
 
-        # 4. Find the center of the human (using the midpoint between hips)
-        # MediaPipe uses normalized coordinates [0.0, 1.0], so we multiply by frame width
+        # 1. Calculate Raw Position
         landmarks = results.pose_landmarks.landmark
-        left_hip_x = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * w
-        right_hip_x = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * w
+        left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * w
+        right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * w
+        person_center_x = int((left_hip + right_hip) / 2)
 
-        person_center_x = int((left_hip_x + right_hip_x) / 2)
-
-        # Draw a vertical line for the person's center
-        cv2.line(image, (person_center_x, 0), (person_center_x, h), (0, 255, 0), 2)
-
-        # 5. Calculate the angle
-        # Positive angle = right of center, Negative angle = left of center
+        # 2. Calculate Raw Angle
         pixel_offset = person_center_x - center_x
-        angle = (pixel_offset / w) * HFOV
+        raw_angle = (pixel_offset / w) * HFOV
 
-        # Display the angle on the screen
-        text = f"Angle: {angle:.1f} degrees"
+        # 3. Add to Buffer (The "Damper")
+        angle_buffer.append(raw_angle)
+
+        # 4. Calculate Smoothed Angle
+        smoothed_angle = sum(angle_buffer) / len(angle_buffer)
+
+        # 5. Logic: Should we move the rotor?
+        # We calculate the difference between where the motor IS vs where it SHOULD BE
+        angle_diff = abs(smoothed_angle - current_motor_angle)
+
+        status_color = (0, 255, 255)  # Yellow (Holding)
+        status_text = "HOLDING"
+
+        # Check if difference is big enough to justify moving (The "Deadband")
+        if angle_diff > MOVEMENT_THRESHOLD:
+            current_motor_angle = smoothed_angle
+            status_color = (0, 255, 0)  # Green (Moving)
+            status_text = "ROTATING"
+
+            # --- OUTPUT FOR ROTOR ---
+            print(f">>> ROTOR COMMAND: Rotate to {current_motor_angle:.1f} deg")
+
+        # --- VISUALIZATION ---
+        # Draw the person's center
+        cv2.line(image, (person_center_x, 0), (person_center_x, h), status_color, 2)
+
+        # Display info on screen
         cv2.putText(
             image,
-            text,
-            (10, 50),
+            f"Status: {status_text}",
+            (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
+            0.7,
+            status_color,
             2,
-            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            f"Target Angle: {smoothed_angle:.1f}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (200, 200, 200),
+            1,
+        )
+        cv2.putText(
+            image,
+            f"Locked Angle: {current_motor_angle:.1f}",
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            1,
         )
 
-    # Show the final image
-    cv2.imshow("Human Angle Tracker", image)
-
-    # Break loop if 'q' is pressed
+    cv2.imshow("Basketball Tracker", image)
     if cv2.waitKey(5) & 0xFF == ord("q"):
         break
 
-# Clean up
 cap.release()
 cv2.destroyAllWindows()
