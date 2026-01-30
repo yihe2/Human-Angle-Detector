@@ -4,6 +4,7 @@ import numpy as np
 from collections import deque
 import time
 from picamera2 import Picamera2
+import os
 
 # --- CONFIGURATION VARIABLES ---
 # 1. Smoothing: How many frames to average? (Higher = Smoother but slower response)
@@ -40,6 +41,10 @@ print("  BASKETBALL TRACKING SYSTEM STARTED   ")
 print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
 print(f"  Deadband:  {MOVEMENT_THRESHOLD} degrees")
 print("---------------------------------------")
+
+headless = os.environ.get("HEADLESS", "0") == "1" or not os.environ.get("DISPLAY")
+if headless:
+    print("Running in headless mode (no display).")
 
 while True:
     frame = picam2.capture_array()
@@ -127,9 +132,10 @@ while True:
             1,
         )
 
-    cv2.imshow("Basketball Tracker", image)
-    if cv2.waitKey(5) & 0xFF == ord("q"):
-        break
+    if not headless:
+        cv2.imshow("Basketball Tracker", image)
+        if cv2.waitKey(5) & 0xFF == ord("q"):
+            break
 
 picam2.stop()
 cv2.destroyAllWindows()
