@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 from collections import deque
 import time
+from picamera2 import Picamera2
 
 # --- CONFIGURATION VARIABLES ---
 # 1. Smoothing: How many frames to average? (Higher = Smoother but slower response)
@@ -29,7 +30,10 @@ angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
 current_motor_angle = 0.0  # Where the machine is currently pointing
 last_command_time = 0
 
-cap = cv2.VideoCapture(0)
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(main={"format": "BGR888", "size": (640, 480)})
+picam2.configure(config)
+picam2.start()
 
 print("---------------------------------------")
 print("  BASKETBALL TRACKING SYSTEM STARTED   ")
@@ -37,11 +41,8 @@ print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
 print(f"  Deadband:  {MOVEMENT_THRESHOLD} degrees")
 print("---------------------------------------")
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        print("Ignoring empty camera frame.")
-        continue
+while True:
+    frame = picam2.capture_array()
 
     h, w, _ = frame.shape
     center_x = w // 2
@@ -130,5 +131,5 @@ while cap.isOpened():
     if cv2.waitKey(5) & 0xFF == ord("q"):
         break
 
-cap.release()
+picam2.stop()
 cv2.destroyAllWindows()
