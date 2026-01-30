@@ -30,6 +30,12 @@ angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
 # State variables
 current_motor_angle = 0.0  # Where the machine is currently pointing
 last_command_time = 0
+last_frame_time = time.monotonic()
+
+# Virtual motor model (simulated, no hardware required)
+MOTOR_MAX_SPEED_DPS = 60.0  # degrees per second
+MOTOR_MIN_ANGLE = -90.0
+MOTOR_MAX_ANGLE = 90.0
 
 picam2 = Picamera2()
 config = picam2.create_preview_configuration(main={"format": "BGR888", "size": (640, 480)})
@@ -48,6 +54,9 @@ if headless:
 
 while True:
     frame = picam2.capture_array()
+    now = time.monotonic()
+    dt = now - last_frame_time
+    last_frame_time = now
 
     h, w, _ = frame.shape
     center_x = w // 2
@@ -82,6 +91,7 @@ while True:
 
         # 4. Calculate Smoothed Angle
         smoothed_angle = sum(angle_buffer) / len(angle_buffer)
+        smoothed_angle = max(MOTOR_MIN_ANGLE, min(MOTOR_MAX_ANGLE, smoothed_angle))
 
         # 5. Logic: Should we move the rotor?
         # We calculate the difference between where the motor IS vs where it SHOULD BE
@@ -92,7 +102,12 @@ while True:
 
         # Check if difference is big enough to justify moving (The "Deadband")
         if angle_diff > MOVEMENT_THRESHOLD:
-            current_motor_angle = smoothed_angle
+            max_step = MOTOR_MAX_SPEED_DPS * dt
+            if smoothed_angle > current_motor_angle:
+                current_motor_angle = min(current_motor_angle + max_step, smoothed_angle)
+            else:
+                current_motor_angle = max(current_motor_angle - max_step, smoothed_angle)
+            current_motor_angle = max(MOTOR_MIN_ANGLE, min(MOTOR_MAX_ANGLE, current_motor_angle))
             status_color = (0, 255, 0)  # Green (Moving)
             status_text = "ROTATING"
 
@@ -129,6 +144,15 @@ while True:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 255, 255),
+            1,
+        )
+        cv2.putText(
+            image,
+            f"Motor Speed: {MOTOR_MAX_SPEED_DPS:.0f} deg/s",
+            (10, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (180, 180, 180),
             1,
         )
 
