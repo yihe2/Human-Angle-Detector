@@ -67,6 +67,21 @@ class SmoothServo180:
         if self.log_enable:
             log(f"PWM write ? angle={angle:.2f}�, servo.value={value:.3f}")
 
+    def set_angle(self, target_angle, force=False):
+        """
+        Non-blocking write for control loops.
+        Returns True if PWM was updated, False if skipped by deadband.
+        """
+        target_angle = max(self.min_angle, min(self.max_angle, target_angle))
+        if (not force) and abs(target_angle - self.current_angle) < self.deadband:
+            if self.log_enable:
+                log(f"SKIP set_angle ? target={target_angle:.2f}� (within deadband)")
+            return False
+
+        self.current_angle = target_angle
+        self._write_angle(self.current_angle)
+        return True
+
     def move_to(self, target_angle):
         target_angle = max(self.min_angle, min(self.max_angle, target_angle))
         delta = target_angle - self.current_angle
