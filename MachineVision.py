@@ -7,23 +7,27 @@ import mediapipe as mp
 from picamera2 import Picamera2
 
 # --- TRACKING CONFIG ---
-SMOOTHING_WINDOW = max(1, int(os.environ.get("SMOOTHING_WINDOW", "4")))
+SMOOTHING_WINDOW = max(1, int(os.environ.get("SMOOTHING_WINDOW", "6")))
 HFOV = float(os.environ.get("HFOV", "88.0"))
-RAW_TARGET_BLEND = min(max(float(os.environ.get("RAW_TARGET_BLEND", "0.7")), 0.0), 1.0)
+RAW_TARGET_BLEND = min(max(float(os.environ.get("RAW_TARGET_BLEND", "0.35")), 0.0), 1.0)
 
 # --- MOTOR MODEL ---
-MOTOR_MAX_SPEED_DPS = 60.0
+MOTOR_MAX_SPEED_DPS = float(os.environ.get("MOTOR_MAX_SPEED_DPS", "35.0"))
 MOTOR_MIN_ANGLE = -90.0
 MOTOR_MAX_ANGLE = 90.0
 MOTOR_CONTROL_MODE = os.environ.get("MOTOR_CONTROL_MODE", "servo_smooth").lower()
 MOTOR_COMMAND_EPSILON_DEG = 0.2
 TRACKING_DEADBAND_DEG = max(
-    float(os.environ.get("TRACKING_DEADBAND_DEG", "0.2")),
+    float(os.environ.get("TRACKING_DEADBAND_DEG", "0.3")),
     MOTOR_COMMAND_EPSILON_DEG,
 )
-TARGET_JITTER_TOLERANCE_DEG = max(
-    float(os.environ.get("TARGET_JITTER_TOLERANCE_DEG", "0.35")),
+CENTER_HOLD_TOLERANCE_DEG = max(
+    float(os.environ.get("CENTER_HOLD_TOLERANCE_DEG", "0.9")),
     TRACKING_DEADBAND_DEG,
+)
+TRACKING_RESPONSE_GAIN = min(
+    max(float(os.environ.get("TRACKING_RESPONSE_GAIN", "0.65")), 0.1),
+    1.0,
 )
 ROTATING_STATUS_THRESHOLD_DEG = max(
     float(os.environ.get("ROTATING_STATUS_THRESHOLD_DEG", "1.2")),
@@ -266,7 +270,6 @@ def main():
     headless = os.environ.get("HEADLESS", "0") == "1" or not os.environ.get("DISPLAY")
 
     angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
-    tracked_target_angle = None
     last_frame_time = time.monotonic()
     turret_state = STATE_TRACKING
     armed_start_time = 0.0
@@ -304,8 +307,9 @@ def main():
         print("  FREE TURRET TRACKING SYSTEM STARTED  ")
         print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
         print(f"  Raw target blend:   {RAW_TARGET_BLEND:.2f}")
+        print(f"  Response gain:      {TRACKING_RESPONSE_GAIN:.2f}")
         print(f"  Tracking deadband: {TRACKING_DEADBAND_DEG:.2f} degrees")
-        print(f"  Target jitter tol: {TARGET_JITTER_TOLERANCE_DEG:.2f} degrees")
+        print(f"  Center hold tol:   {CENTER_HOLD_TOLERANCE_DEG:.2f} degrees")
         print(f"  Lock tolerance:    {AIM_LOCK_TOLERANCE_DEG:.2f} degrees")
         print(f"  Trigger:   Double down-stroke")
         print(f"  Motor:     {motor.mode}")
@@ -358,39 +362,39 @@ def main():
 
                 in_safe_zone = safe_left <= person_center_x <= safe_right
                 pixel_offset = person_center_x - center_x
-                raw_angle = (pixel_offset / w) * HFOV
-                angle_buffer.append(raw_angle)
-                smoothed_angle = sum(angle_buffer) / len(angle_buffer)
-                blended_angle = (
-                    RAW_TARGET_BLEND * raw_angle
-                    + (1.0 - RAW_TARGET_BLEND) * smoothed_angle
+                raw_offset_angle = (pixel_offset / w) * HFOV
+                angle_buffer.append(raw_offset_angle)
+                smoothed_offset_angle = sum(angle_buffer) / len(angle_buffer)
+                blended_offset_angle = (
+                    RAW_TARGET_BLEND * raw_offset_angle
+                    + (1.0 - RAW_TARGET_BLEND) * smoothed_offset_angle
                 )
 
-                blended_angle = clamp(blended_angle, MOTOR_MIN_ANGLE, MOTOR_MAX_ANGLE)
-                if tracked_target_angle is None:
-                    tracked_target_angle = blended_angle
-                elif (
-                    abs(blended_angle - tracked_target_angle)
-                    >= TARGET_JITTER_TOLERANCE_DEG
-                ):
-                    tracked_target_angle = blended_angle
+                if abs(blended_offset_angle) <= CENTER_HOLD_TOLERANCE_DEG:
+                    correction_angle = 0.0
+                else:
+                    correction_angle = blended_offset_angle * TRACKING_RESPONSE_GAIN
 
-                target_angle = tracked_target_angle
+                target_angle = clamp(
+                    motor.current_angle + correction_angle,
+                    MOTOR_MIN_ANGLE,
+                    MOTOR_MAX_ANGLE,
+                )
                 angle_diff = abs(target_angle - motor.current_angle)
 
                 status_color = (0, 255, 255)
-                status_text = "HOLDING"
+                status_text = "CENTERED" if correction_angle == 0.0 else "HOLDING"
                 if angle_diff > TRACKING_DEADBAND_DEG:
                     moved = motor.move_towards(target_angle, dt)
                     if moved:
                         if angle_diff > ROTATING_STATUS_THRESHOLD_DEG:
                             status_color = (0, 255, 0)
-                            status_text = "ROTATING"
+                            status_text = "CORRECTING"
                         else:
                             status_color = (120, 255, 120)
                             status_text = "FINE TRACK"
 
-                lock_error = abs(target_angle - motor.current_angle)
+                lock_error = abs(blended_offset_angle)
                 if lock_error <= AIM_LOCK_TOLERANCE_DEG:
                     stable_frame_count += 1
                 else:
@@ -452,7 +456,6 @@ def main():
             else:
                 stable_frame_count = 0
                 angle_buffer.clear()
-                tracked_target_angle = None
                 reset_wrist_history(gesture_state)
                 if (
                     turret_state == STATE_ARMED
