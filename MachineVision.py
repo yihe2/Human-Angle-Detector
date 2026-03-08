@@ -7,9 +7,8 @@ import mediapipe as mp
 from picamera2 import Picamera2
 
 # --- TRACKING CONFIG ---
-SMOOTHING_WINDOW = 15
-MOVEMENT_THRESHOLD = 3.0
-HFOV = 88.0
+SMOOTHING_WINDOW = max(1, int(os.environ.get("SMOOTHING_WINDOW", "6")))
+HFOV = float(os.environ.get("HFOV", "88.0"))
 
 # --- MOTOR MODEL ---
 MOTOR_MAX_SPEED_DPS = 60.0
@@ -17,6 +16,14 @@ MOTOR_MIN_ANGLE = -90.0
 MOTOR_MAX_ANGLE = 90.0
 MOTOR_CONTROL_MODE = os.environ.get("MOTOR_CONTROL_MODE", "servo_smooth").lower()
 MOTOR_COMMAND_EPSILON_DEG = 0.2
+TRACKING_DEADBAND_DEG = max(
+    float(os.environ.get("TRACKING_DEADBAND_DEG", "0.6")),
+    MOTOR_COMMAND_EPSILON_DEG,
+)
+ROTATING_STATUS_THRESHOLD_DEG = max(
+    float(os.environ.get("ROTATING_STATUS_THRESHOLD_DEG", "1.2")),
+    TRACKING_DEADBAND_DEG,
+)
 MOTOR_DIRECTION = os.environ.get("MOTOR_DIRECTION", "normal").lower()
 MOTOR_DIRECTION_SIGN = (
     -1.0
@@ -43,7 +50,7 @@ ARMED_TIMEOUT_SECONDS = 1.2
 # --- SAFETY CONFIG ---
 FIRE_COOLDOWN_SECONDS = 2.0
 MAX_FIRES_PER_MINUTE = 20
-AIM_LOCK_TOLERANCE_DEG = MOVEMENT_THRESHOLD
+AIM_LOCK_TOLERANCE_DEG = float(os.environ.get("AIM_LOCK_TOLERANCE_DEG", "1.5"))
 AIM_STABLE_FRAMES_REQUIRED = 8
 SAFE_ZONE_MARGIN_RATIO = 0.15
 FIRE_FLASH_SECONDS = 0.25
@@ -177,45 +184,58 @@ class MotorController:
             self.gpio.cleanup()
 
 
-def reset_wrist_history(gesture_state):
-    gesture_state["prev_wrist_y"] = None
-    gesture_state["prev_wrist_time"] = None
+def reset_wrist_history(gesture_state, wrist_name=None):
+    wrist_names = (wrist_name,) if wrist_name is not None else gesture_state["wrists"]
+    for name in wrist_names:
+        gesture_state["wrists"][name]["prev_y"] = None
+        gesture_state["wrists"][name]["prev_time"] = None
 
 
 def detect_downstroke(landmarks, now, gesture_state, pose_module):
     left_wrist = landmarks[pose_module.PoseLandmark.LEFT_WRIST.value]
     right_wrist = landmarks[pose_module.PoseLandmark.RIGHT_WRIST.value]
-    if left_wrist.visibility >= right_wrist.visibility:
-        wrist = left_wrist
-        wrist_name = "L"
-    else:
-        wrist = right_wrist
-        wrist_name = "R"
+    wrists = {"L": left_wrist, "R": right_wrist}
+    active_wrist = "L" if left_wrist.visibility >= right_wrist.visibility else "R"
+    active_velocity = 0.0
+    downstroke_wrist = None
+    downstroke_velocity = 0.0
 
-    if wrist.visibility < WRIST_VISIBILITY_MIN:
-        reset_wrist_history(gesture_state)
-        return False, 0.0, wrist_name
+    for wrist_name, wrist in wrists.items():
+        if wrist.visibility < WRIST_VISIBILITY_MIN:
+            reset_wrist_history(gesture_state, wrist_name)
+            continue
 
-    wrist_y = wrist.y
-    prev_y = gesture_state["prev_wrist_y"]
-    prev_t = gesture_state["prev_wrist_time"]
-    velocity = 0.0
-    downstroke = False
+        wrist_state = gesture_state["wrists"][wrist_name]
+        prev_y = wrist_state["prev_y"]
+        prev_t = wrist_state["prev_time"]
+        velocity = 0.0
 
-    if prev_y is not None and prev_t is not None:
-        dt = max(now - prev_t, 1e-6)
-        velocity = (wrist_y - prev_y) / dt
-        if (
-            velocity >= DOWNSTROKE_VELOCITY_THRESHOLD
-            and now - gesture_state["last_downstroke_time"]
-            >= DOWNSTROKE_MIN_INTERVAL_SECONDS
-        ):
-            downstroke = True
-            gesture_state["last_downstroke_time"] = now
+        if prev_y is not None and prev_t is not None:
+            dt = max(now - prev_t, 1e-6)
+            velocity = (wrist.y - prev_y) / dt
+            if (
+                velocity >= DOWNSTROKE_VELOCITY_THRESHOLD
+                and now - gesture_state["last_downstroke_time"]
+                >= DOWNSTROKE_MIN_INTERVAL_SECONDS
+                and velocity > downstroke_velocity
+            ):
+                downstroke_wrist = wrist_name
+                downstroke_velocity = velocity
 
-    gesture_state["prev_wrist_y"] = wrist_y
-    gesture_state["prev_wrist_time"] = now
-    return downstroke, velocity, wrist_name
+        wrist_state["prev_y"] = wrist.y
+        wrist_state["prev_time"] = now
+
+        if wrist_name == active_wrist:
+            active_velocity = velocity
+
+    if downstroke_wrist is not None:
+        gesture_state["last_downstroke_time"] = now
+        return True, downstroke_velocity, downstroke_wrist
+
+    if wrists[active_wrist].visibility < WRIST_VISIBILITY_MIN:
+        return False, 0.0, active_wrist
+
+    return False, active_velocity, active_wrist
 
 
 def fire_gate_ok(now, last_fire_time, fire_history, stable_frames, in_safe_zone):
@@ -231,259 +251,310 @@ def fire_gate_ok(now, last_fire_time, fire_history, stable_frames, in_safe_zone)
 
 
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5
-)
 mp_drawing = mp.solutions.drawing_utils
 
-angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
-last_frame_time = time.monotonic()
-motor = MotorController(MOTOR_CONTROL_MODE)
+def main():
+    pose = None
+    motor = None
+    picam2 = None
+    camera_started = False
+    headless = os.environ.get("HEADLESS", "0") == "1" or not os.environ.get("DISPLAY")
 
-turret_state = STATE_TRACKING
-armed_start_time = 0.0
-first_strike_time = 0.0
-stable_frame_count = 0
-last_fire_time = -1e9
-fire_history = deque()
-fire_flash_until = 0.0
-last_gate_reason = "READY"
-gesture_state = {
-    "prev_wrist_y": None,
-    "prev_wrist_time": None,
-    "last_downstroke_time": -1e9,
-}
+    angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
+    last_frame_time = time.monotonic()
+    turret_state = STATE_TRACKING
+    armed_start_time = 0.0
+    first_strike_time = 0.0
+    stable_frame_count = 0
+    last_fire_time = -1e9
+    fire_history = deque()
+    fire_flash_until = 0.0
+    last_gate_reason = "READY"
+    gesture_state = {
+        "wrists": {
+            "L": {"prev_y": None, "prev_time": None},
+            "R": {"prev_y": None, "prev_time": None},
+        },
+        "last_downstroke_time": -1e9,
+    }
 
-picam2 = Picamera2()
-config = picam2.create_preview_configuration(
-    main={"format": "BGR888", "size": (640, 480)}
-)
-picam2.configure(config)
-picam2.start()
+    try:
+        pose = mp_pose.Pose(
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        motor = MotorController(MOTOR_CONTROL_MODE)
 
-print("---------------------------------------")
-print("  FREE TURRET TRACKING SYSTEM STARTED  ")
-print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
-print(f"  Deadband:  {MOVEMENT_THRESHOLD} degrees")
-print(f"  Trigger:   Double down-stroke")
-print(f"  Motor:     {motor.mode}")
-print("---------------------------------------")
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(
+            main={"format": "BGR888", "size": (640, 480)}
+        )
+        picam2.configure(config)
+        picam2.start()
+        camera_started = True
 
-headless = os.environ.get("HEADLESS", "0") == "1" or not os.environ.get("DISPLAY")
-if headless:
-    print("Running in headless mode (no display).")
+        print("---------------------------------------")
+        print("  FREE TURRET TRACKING SYSTEM STARTED  ")
+        print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
+        print(f"  Tracking deadband: {TRACKING_DEADBAND_DEG:.2f} degrees")
+        print(f"  Lock tolerance:    {AIM_LOCK_TOLERANCE_DEG:.2f} degrees")
+        print(f"  Trigger:   Double down-stroke")
+        print(f"  Motor:     {motor.mode}")
+        print("---------------------------------------")
 
-try:
-    while True:
-        frame = picam2.capture_array()
-        now = time.monotonic()
-        dt = max(now - last_frame_time, 1e-4)
-        last_frame_time = now
+        if headless:
+            print("Running in headless mode (no display).")
 
-        while fire_history and now - fire_history[0] > 60.0:
-            fire_history.popleft()
+        while True:
+            frame = picam2.capture_array()
+            now = time.monotonic()
+            dt = max(now - last_frame_time, 1e-4)
+            last_frame_time = now
 
-        h, w, _ = frame.shape
-        center_x = w // 2
-        safe_margin = int(w * SAFE_ZONE_MARGIN_RATIO)
-        safe_left = safe_margin
-        safe_right = w - safe_margin
+            while fire_history and now - fire_history[0] > 60.0:
+                fire_history.popleft()
 
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image.flags.writeable = False
-        results = pose.process(image)
-        image.flags.writeable = True
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            h, w, _ = frame.shape
+            center_x = w // 2
+            safe_margin = int(w * SAFE_ZONE_MARGIN_RATIO)
+            safe_left = safe_margin
+            safe_right = w - safe_margin
 
-        cv2.line(image, (center_x, 0), (center_x, h), (255, 255, 255), 1)
-        cv2.line(image, (safe_left, 0), (safe_left, h), (255, 120, 0), 1)
-        cv2.line(image, (safe_right, 0), (safe_right, h), (255, 120, 0), 1)
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image.flags.writeable = False
+            results = pose.process(image)
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-        status_color = (0, 0, 255)
-        status_text = "NO TARGET"
-        target_angle = None
-        in_safe_zone = False
-        wrist_velocity = 0.0
-        active_wrist = "-"
+            cv2.line(image, (center_x, 0), (center_x, h), (255, 255, 255), 1)
+            cv2.line(image, (safe_left, 0), (safe_left, h), (255, 120, 0), 1)
+            cv2.line(image, (safe_right, 0), (safe_right, h), (255, 120, 0), 1)
 
-        if results.pose_landmarks:
-            mp_drawing.draw_landmarks(
-                image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
-            )
+            status_color = (0, 0, 255)
+            status_text = "NO TARGET"
+            target_angle = None
+            in_safe_zone = False
+            wrist_velocity = 0.0
+            active_wrist = "-"
 
-            landmarks = results.pose_landmarks.landmark
-            left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * w
-            right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * w
-            person_center_x = int((left_hip + right_hip) / 2)
+            if results.pose_landmarks:
+                mp_drawing.draw_landmarks(
+                    image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
+                )
 
-            in_safe_zone = safe_left <= person_center_x <= safe_right
-            pixel_offset = person_center_x - center_x
-            raw_angle = (pixel_offset / w) * HFOV
-            angle_buffer.append(raw_angle)
+                landmarks = results.pose_landmarks.landmark
+                left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * w
+                right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * w
+                person_center_x = int((left_hip + right_hip) / 2)
 
-            target_angle = clamp(
-                sum(angle_buffer) / len(angle_buffer), MOTOR_MIN_ANGLE, MOTOR_MAX_ANGLE
-            )
-            angle_diff = abs(target_angle - motor.current_angle)
+                in_safe_zone = safe_left <= person_center_x <= safe_right
+                pixel_offset = person_center_x - center_x
+                raw_angle = (pixel_offset / w) * HFOV
+                angle_buffer.append(raw_angle)
 
-            status_color = (0, 255, 255)
-            status_text = "HOLDING"
-            if angle_diff > MOVEMENT_THRESHOLD:
-                moved = motor.move_towards(target_angle, dt)
-                if moved:
-                    status_color = (0, 255, 0)
-                    status_text = "ROTATING"
+                target_angle = clamp(
+                    sum(angle_buffer) / len(angle_buffer),
+                    MOTOR_MIN_ANGLE,
+                    MOTOR_MAX_ANGLE,
+                )
+                angle_diff = abs(target_angle - motor.current_angle)
 
-            lock_error = abs(target_angle - motor.current_angle)
-            if lock_error <= AIM_LOCK_TOLERANCE_DEG:
-                stable_frame_count += 1
-            else:
-                stable_frame_count = 0
+                status_color = (0, 255, 255)
+                status_text = "HOLDING"
+                if angle_diff > TRACKING_DEADBAND_DEG:
+                    moved = motor.move_towards(target_angle, dt)
+                    if moved:
+                        if angle_diff > ROTATING_STATUS_THRESHOLD_DEG:
+                            status_color = (0, 255, 0)
+                            status_text = "ROTATING"
+                        else:
+                            status_color = (120, 255, 120)
+                            status_text = "FINE TRACK"
 
-            downstroke, wrist_velocity, active_wrist = detect_downstroke(
-                landmarks, now, gesture_state, mp_pose
-            )
+                lock_error = abs(target_angle - motor.current_angle)
+                if lock_error <= AIM_LOCK_TOLERANCE_DEG:
+                    stable_frame_count += 1
+                else:
+                    stable_frame_count = 0
 
-            if turret_state == STATE_TRACKING:
-                if downstroke:
-                    turret_state = STATE_ARMED
-                    armed_start_time = now
-                    first_strike_time = now
-                    last_gate_reason = "ARMED_1ST_STRIKE"
+                downstroke, wrist_velocity, active_wrist = detect_downstroke(
+                    landmarks, now, gesture_state, mp_pose
+                )
 
-            elif turret_state == STATE_ARMED:
-                if now - armed_start_time > ARMED_TIMEOUT_SECONDS:
-                    turret_state = STATE_TRACKING
-                    last_gate_reason = "ARM_TIMEOUT"
-                elif downstroke:
-                    if now - first_strike_time > DOUBLE_STRIKE_WINDOW_SECONDS:
+                if turret_state == STATE_TRACKING:
+                    if downstroke:
+                        turret_state = STATE_ARMED
                         armed_start_time = now
                         first_strike_time = now
-                        last_gate_reason = "REARMED"
-                    else:
-                        can_fire, gate_reason = fire_gate_ok(
-                            now,
-                            last_fire_time,
-                            fire_history,
-                            stable_frame_count,
-                            in_safe_zone,
-                        )
-                        last_gate_reason = gate_reason
-                        if can_fire:
-                            turret_state = STATE_FIRE
+                        last_gate_reason = "ARMED_1ST_STRIKE"
+
+                elif turret_state == STATE_ARMED:
+                    if now - armed_start_time > ARMED_TIMEOUT_SECONDS:
+                        turret_state = STATE_TRACKING
+                        last_gate_reason = "ARM_TIMEOUT"
+                    elif downstroke:
+                        if now - first_strike_time > DOUBLE_STRIKE_WINDOW_SECONDS:
+                            armed_start_time = now
+                            first_strike_time = now
+                            last_gate_reason = "REARMED"
                         else:
-                            turret_state = STATE_TRACKING
-                            print(f">>> FIRE BLOCKED: {gate_reason}")
+                            can_fire, gate_reason = fire_gate_ok(
+                                now,
+                                last_fire_time,
+                                fire_history,
+                                stable_frame_count,
+                                in_safe_zone,
+                            )
+                            last_gate_reason = gate_reason
+                            if can_fire:
+                                turret_state = STATE_FIRE
+                            else:
+                                turret_state = STATE_TRACKING
+                                print(f">>> FIRE BLOCKED: {gate_reason}")
 
-            if turret_state == STATE_FIRE:
-                print(f">>> FIRE COMMAND: Launch puck at {motor.current_angle:.1f} deg")
-                last_fire_time = now
-                fire_history.append(now)
-                fire_flash_until = now + FIRE_FLASH_SECONDS
-                turret_state = STATE_TRACKING
-                last_gate_reason = "FIRED"
+                if turret_state == STATE_FIRE:
+                    print(
+                        f">>> FIRE COMMAND: Launch puck at {motor.current_angle:.1f} deg"
+                    )
+                    last_fire_time = now
+                    fire_history.append(now)
+                    fire_flash_until = now + FIRE_FLASH_SECONDS
+                    turret_state = STATE_TRACKING
+                    last_gate_reason = "FIRED"
 
-            person_line_color = status_color if in_safe_zone else (0, 0, 255)
-            cv2.line(image, (person_center_x, 0), (person_center_x, h), person_line_color, 2)
-        else:
-            stable_frame_count = 0
-            reset_wrist_history(gesture_state)
-            if turret_state == STATE_ARMED and now - armed_start_time > ARMED_TIMEOUT_SECONDS:
-                turret_state = STATE_TRACKING
-                last_gate_reason = "ARM_TIMEOUT_NO_TARGET"
+                person_line_color = status_color if in_safe_zone else (0, 0, 255)
+                cv2.line(
+                    image,
+                    (person_center_x, 0),
+                    (person_center_x, h),
+                    person_line_color,
+                    2,
+                )
+            else:
+                stable_frame_count = 0
+                angle_buffer.clear()
+                reset_wrist_history(gesture_state)
+                if (
+                    turret_state == STATE_ARMED
+                    and now - armed_start_time > ARMED_TIMEOUT_SECONDS
+                ):
+                    turret_state = STATE_TRACKING
+                    last_gate_reason = "ARM_TIMEOUT_NO_TARGET"
 
-        mode_label = turret_state
-        mode_color = (220, 220, 220)
-        if turret_state == STATE_ARMED:
-            mode_color = (0, 165, 255)
-        if now < fire_flash_until:
-            mode_label = STATE_FIRE
-            mode_color = (0, 0, 255)
+            mode_label = turret_state
+            mode_color = (220, 220, 220)
+            if turret_state == STATE_ARMED:
+                mode_color = (0, 165, 255)
+            if now < fire_flash_until:
+                mode_label = STATE_FIRE
+                mode_color = (0, 0, 255)
 
-        cooldown_left = max(0.0, FIRE_COOLDOWN_SECONDS - (now - last_fire_time))
+            cooldown_left = max(0.0, FIRE_COOLDOWN_SECONDS - (now - last_fire_time))
 
-        cv2.putText(
-            image,
-            f"Track: {status_text}",
-            (10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            status_color,
-            2,
-        )
-        cv2.putText(
-            image,
-            f"Mode: {mode_label}",
-            (10, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            mode_color,
-            2,
-        )
-        if target_angle is not None:
             cv2.putText(
                 image,
-                f"Target/Locked: {target_angle:.1f} / {motor.current_angle:.1f}",
-                (10, 82),
+                f"Track: {status_text}",
+                (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                status_color,
+                2,
+            )
+            cv2.putText(
+                image,
+                f"Mode: {mode_label}",
+                (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                mode_color,
+                2,
+            )
+            if target_angle is not None:
+                cv2.putText(
+                    image,
+                    f"Target/Locked: {target_angle:.1f} / {motor.current_angle:.1f}",
+                    (10, 82),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (220, 220, 220),
+                    1,
+                )
+            else:
+                cv2.putText(
+                    image,
+                    f"Locked Angle: {motor.current_angle:.1f}",
+                    (10, 82),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (220, 220, 220),
+                    1,
+                )
+            cv2.putText(
+                image,
+                f"Aim Stable: {stable_frame_count}/{AIM_STABLE_FRAMES_REQUIRED}",
+                (10, 108),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (220, 220, 220),
                 1,
             )
-        else:
             cv2.putText(
                 image,
-                f"Locked Angle: {motor.current_angle:.1f}",
-                (10, 82),
+                (
+                    f"Cooldown: {cooldown_left:.1f}s  Rate: "
+                    f"{len(fire_history)}/{MAX_FIRES_PER_MINUTE} per min"
+                ),
+                (10, 134),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (220, 220, 220),
+                0.5,
+                (180, 180, 180),
                 1,
             )
-        cv2.putText(
-            image,
-            f"Aim Stable: {stable_frame_count}/{AIM_STABLE_FRAMES_REQUIRED}",
-            (10, 108),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (220, 220, 220),
-            1,
-        )
-        cv2.putText(
-            image,
-            f"Cooldown: {cooldown_left:.1f}s  Rate: {len(fire_history)}/{MAX_FIRES_PER_MINUTE} per min",
-            (10, 134),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (180, 180, 180),
-            1,
-        )
-        cv2.putText(
-            image,
-            f"Wrist {active_wrist} Vy: {wrist_velocity:.2f}  Gate: {last_gate_reason}",
-            (10, 160),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (180, 180, 180),
-            1,
-        )
-        cv2.putText(
-            image,
-            f"Safe Zone: {'OK' if in_safe_zone else 'BLOCKED'}",
-            (10, 186),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 220, 0) if in_safe_zone else (0, 0, 255),
-            1,
-        )
+            cv2.putText(
+                image,
+                f"Wrist {active_wrist} Vy: {wrist_velocity:.2f}  Gate: {last_gate_reason}",
+                (10, 160),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (180, 180, 180),
+                1,
+            )
+            cv2.putText(
+                image,
+                f"Safe Zone: {'OK' if in_safe_zone else 'BLOCKED'}",
+                (10, 186),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 220, 0) if in_safe_zone else (0, 0, 255),
+                1,
+            )
 
-        if not headless:
-            cv2.imshow("Free Turret Tracker", image)
-            if cv2.waitKey(5) & 0xFF == ord("q"):
-                break
-except KeyboardInterrupt:
-    print("Stopping system...")
-finally:
-    motor.cleanup()
-    picam2.stop()
-    cv2.destroyAllWindows()
+            if not headless:
+                cv2.imshow("Free Turret Tracker", image)
+                if cv2.waitKey(5) & 0xFF == ord("q"):
+                    break
+    except KeyboardInterrupt:
+        print("Stopping system...")
+    finally:
+        if motor is not None:
+            try:
+                motor.cleanup()
+            except Exception as exc:
+                print(f"Motor cleanup failed: {exc}")
+        if picam2 is not None:
+            try:
+                if camera_started:
+                    picam2.stop()
+            except Exception as exc:
+                print(f"Camera stop failed: {exc}")
+        if pose is not None:
+            try:
+                pose.close()
+            except Exception as exc:
+                print(f"Pose cleanup failed: {exc}")
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
