@@ -34,6 +34,7 @@ class SmoothServo180:
             pin,
             min_pulse_width=min_pulse,
             max_pulse_width=max_pulse,
+            initial_value=None,
             pin_factory=self.factory
         )
 
@@ -42,8 +43,10 @@ class SmoothServo180:
         self.max_speed = max_speed_deg
         self.deadband = deadband
 
+        # Track the logical center internally, but do not drive the servo on
+        # startup. This avoids an unconditional "snap to center" before the
+        # vision loop has confirmed a target.
         self.current_angle = 90.0
-        self._write_angle(self.current_angle)
 
         if self.log_enable:
             log("=== SERVO INIT ===")

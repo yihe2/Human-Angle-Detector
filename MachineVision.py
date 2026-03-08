@@ -10,6 +10,15 @@ from picamera2 import Picamera2
 SMOOTHING_WINDOW = max(1, int(os.environ.get("SMOOTHING_WINDOW", "6")))
 HFOV = float(os.environ.get("HFOV", "88.0"))
 RAW_TARGET_BLEND = min(max(float(os.environ.get("RAW_TARGET_BLEND", "0.35")), 0.0), 1.0)
+STARTUP_MOTOR_HOLD_SECONDS = max(
+    float(os.environ.get("STARTUP_MOTOR_HOLD_SECONDS", "1.0")),
+    0.0,
+)
+TARGET_ACQUIRE_FRAMES = max(1, int(os.environ.get("TARGET_ACQUIRE_FRAMES", "5")))
+HIP_VISIBILITY_MIN = min(
+    max(float(os.environ.get("HIP_VISIBILITY_MIN", "0.65")), 0.0),
+    1.0,
+)
 
 # --- MOTOR MODEL ---
 MOTOR_MAX_SPEED_DPS = float(os.environ.get("MOTOR_MAX_SPEED_DPS", "35.0"))
@@ -284,9 +293,11 @@ def main():
     angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
     last_frame_time = time.monotonic()
     last_control_time = last_frame_time
+    startup_hold_until = last_frame_time + STARTUP_MOTOR_HOLD_SECONDS
     settle_until = 0.0
     persistent_offset_frames = 0
     persistent_offset_sign = 0
+    target_visible_frames = 0
     turret_state = STATE_TRACKING
     armed_start_time = 0.0
     first_strike_time = 0.0
@@ -322,6 +333,8 @@ def main():
         print("---------------------------------------")
         print("  FREE TURRET TRACKING SYSTEM STARTED  ")
         print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
+        print(f"  Startup hold:       {STARTUP_MOTOR_HOLD_SECONDS:.2f}s")
+        print(f"  Acquire frames:     {TARGET_ACQUIRE_FRAMES}")
         print(f"  Raw target blend:   {RAW_TARGET_BLEND:.2f}")
         print(f"  Response gain:      {TRACKING_RESPONSE_GAIN:.2f}")
         print(f"  Correction sign:    {TRACKING_CORRECTION_SIGN:+.0f}")
@@ -376,8 +389,22 @@ def main():
                 )
 
                 landmarks = results.pose_landmarks.landmark
-                left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x * w
-                right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x * w
+                left_hip_landmark = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
+                right_hip_landmark = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
+                hips_visible = (
+                    left_hip_landmark.visibility >= HIP_VISIBILITY_MIN
+                    and right_hip_landmark.visibility >= HIP_VISIBILITY_MIN
+                )
+                if hips_visible:
+                    target_visible_frames += 1
+                else:
+                    target_visible_frames = 0
+                    angle_buffer.clear()
+                    persistent_offset_frames = 0
+                    persistent_offset_sign = 0
+
+                left_hip = left_hip_landmark.x * w
+                right_hip = right_hip_landmark.x * w
                 person_center_x = int((left_hip + right_hip) / 2)
 
                 in_safe_zone = safe_left <= person_center_x <= safe_right
@@ -386,7 +413,24 @@ def main():
                 correction_angle = 0.0
                 blended_offset_angle = raw_offset_angle
 
-                if now < settle_until:
+                tracking_ready = (
+                    hips_visible
+                    and target_visible_frames >= TARGET_ACQUIRE_FRAMES
+                    and now >= startup_hold_until
+                )
+
+                if not tracking_ready:
+                    angle_buffer.clear()
+                    target_angle = motor.current_angle
+                    angle_diff = 0.0
+                    correction_angle = 0.0
+                    if now < startup_hold_until:
+                        status_text = "STARTUP HOLD"
+                    elif hips_visible:
+                        status_text = "ACQUIRING"
+                    else:
+                        status_text = "LOW CONFIDENCE"
+                elif now < settle_until:
                     angle_buffer.clear()
                     target_angle = motor.current_angle
                     angle_diff = 0.0
@@ -430,7 +474,9 @@ def main():
                     angle_diff = abs(target_angle - motor.current_angle)
 
                 status_color = (0, 255, 255)
-                if now < settle_until:
+                if not tracking_ready:
+                    status_color = (0, 215, 255)
+                elif now < settle_until:
                     status_text = "SETTLING"
                 elif correction_angle == 0.0:
                     status_text = "CENTERED"
@@ -515,6 +561,7 @@ def main():
                 angle_buffer.clear()
                 persistent_offset_frames = 0
                 persistent_offset_sign = 0
+                target_visible_frames = 0
                 settle_until = 0.0
                 reset_wrist_history(gesture_state)
                 if (
