@@ -29,16 +29,28 @@ TRACKING_RESPONSE_GAIN = min(
     max(float(os.environ.get("TRACKING_RESPONSE_GAIN", "0.65")), 0.1),
     1.0,
 )
+TRACKING_CORRECTION_SIGN = -1.0
+CONTROL_UPDATE_INTERVAL_SECONDS = max(
+    float(os.environ.get("CONTROL_UPDATE_INTERVAL_SECONDS", "0.12")),
+    0.02,
+)
+MOTION_SETTLE_SECONDS = max(
+    float(os.environ.get("MOTION_SETTLE_SECONDS", "0.18")),
+    0.0,
+)
+MAX_CORRECTION_STEP_DEG = max(
+    float(os.environ.get("MAX_CORRECTION_STEP_DEG", "3.0")),
+    TRACKING_DEADBAND_DEG,
+)
+OFFSET_PERSISTENCE_FRAMES = max(
+    1, int(os.environ.get("OFFSET_PERSISTENCE_FRAMES", "2"))
+)
 ROTATING_STATUS_THRESHOLD_DEG = max(
     float(os.environ.get("ROTATING_STATUS_THRESHOLD_DEG", "1.2")),
     TRACKING_DEADBAND_DEG,
 )
-MOTOR_DIRECTION = os.environ.get("MOTOR_DIRECTION", "normal").lower()
-MOTOR_DIRECTION_SIGN = (
-    -1.0
-    if MOTOR_DIRECTION in ("reverse", "reversed", "invert", "inverted", "-1")
-    else 1.0
-)
+MOTOR_DIRECTION = "reverse"
+MOTOR_DIRECTION_SIGN = -1.0
 
 # --- SERVO CONFIG ---
 SERVO_GPIO_PIN = int(os.environ.get("SERVO_GPIO_PIN", "18"))
@@ -271,6 +283,10 @@ def main():
 
     angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
     last_frame_time = time.monotonic()
+    last_control_time = last_frame_time
+    settle_until = 0.0
+    persistent_offset_frames = 0
+    persistent_offset_sign = 0
     turret_state = STATE_TRACKING
     armed_start_time = 0.0
     first_strike_time = 0.0
@@ -308,8 +324,12 @@ def main():
         print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
         print(f"  Raw target blend:   {RAW_TARGET_BLEND:.2f}")
         print(f"  Response gain:      {TRACKING_RESPONSE_GAIN:.2f}")
+        print(f"  Correction sign:    {TRACKING_CORRECTION_SIGN:+.0f}")
         print(f"  Tracking deadband: {TRACKING_DEADBAND_DEG:.2f} degrees")
         print(f"  Center hold tol:   {CENTER_HOLD_TOLERANCE_DEG:.2f} degrees")
+        print(f"  Control interval:  {CONTROL_UPDATE_INTERVAL_SECONDS:.2f}s")
+        print(f"  Motion settle:     {MOTION_SETTLE_SECONDS:.2f}s")
+        print(f"  Max correction:    {MAX_CORRECTION_STEP_DEG:.2f} degrees")
         print(f"  Lock tolerance:    {AIM_LOCK_TOLERANCE_DEG:.2f} degrees")
         print(f"  Trigger:   Double down-stroke")
         print(f"  Motor:     {motor.mode}")
@@ -363,30 +383,67 @@ def main():
                 in_safe_zone = safe_left <= person_center_x <= safe_right
                 pixel_offset = person_center_x - center_x
                 raw_offset_angle = (pixel_offset / w) * HFOV
-                angle_buffer.append(raw_offset_angle)
-                smoothed_offset_angle = sum(angle_buffer) / len(angle_buffer)
-                blended_offset_angle = (
-                    RAW_TARGET_BLEND * raw_offset_angle
-                    + (1.0 - RAW_TARGET_BLEND) * smoothed_offset_angle
-                )
+                correction_angle = 0.0
+                blended_offset_angle = raw_offset_angle
 
-                if abs(blended_offset_angle) <= CENTER_HOLD_TOLERANCE_DEG:
-                    correction_angle = 0.0
+                if now < settle_until:
+                    angle_buffer.clear()
+                    target_angle = motor.current_angle
+                    angle_diff = 0.0
                 else:
-                    correction_angle = blended_offset_angle * TRACKING_RESPONSE_GAIN
+                    angle_buffer.append(raw_offset_angle)
+                    smoothed_offset_angle = sum(angle_buffer) / len(angle_buffer)
+                    blended_offset_angle = (
+                        RAW_TARGET_BLEND * raw_offset_angle
+                        + (1.0 - RAW_TARGET_BLEND) * smoothed_offset_angle
+                    )
 
-                target_angle = clamp(
-                    motor.current_angle + correction_angle,
-                    MOTOR_MIN_ANGLE,
-                    MOTOR_MAX_ANGLE,
-                )
-                angle_diff = abs(target_angle - motor.current_angle)
+                    if abs(blended_offset_angle) <= CENTER_HOLD_TOLERANCE_DEG:
+                        persistent_offset_frames = 0
+                        persistent_offset_sign = 0
+                    else:
+                        offset_sign = 1 if blended_offset_angle > 0 else -1
+                        if offset_sign == persistent_offset_sign:
+                            persistent_offset_frames += 1
+                        else:
+                            persistent_offset_sign = offset_sign
+                            persistent_offset_frames = 1
+
+                    if (
+                        abs(blended_offset_angle) > CENTER_HOLD_TOLERANCE_DEG
+                        and persistent_offset_frames >= OFFSET_PERSISTENCE_FRAMES
+                        and now - last_control_time >= CONTROL_UPDATE_INTERVAL_SECONDS
+                    ):
+                        correction_angle = clamp(
+                            blended_offset_angle
+                            * TRACKING_RESPONSE_GAIN
+                            * TRACKING_CORRECTION_SIGN,
+                            -MAX_CORRECTION_STEP_DEG,
+                            MAX_CORRECTION_STEP_DEG,
+                        )
+
+                    target_angle = clamp(
+                        motor.current_angle + correction_angle,
+                        MOTOR_MIN_ANGLE,
+                        MOTOR_MAX_ANGLE,
+                    )
+                    angle_diff = abs(target_angle - motor.current_angle)
 
                 status_color = (0, 255, 255)
-                status_text = "CENTERED" if correction_angle == 0.0 else "HOLDING"
+                if now < settle_until:
+                    status_text = "SETTLING"
+                elif correction_angle == 0.0:
+                    status_text = "CENTERED"
+                else:
+                    status_text = "HOLDING"
                 if angle_diff > TRACKING_DEADBAND_DEG:
-                    moved = motor.move_towards(target_angle, dt)
+                    control_dt = max(now - last_control_time, CONTROL_UPDATE_INTERVAL_SECONDS)
+                    moved = motor.move_towards(target_angle, control_dt)
                     if moved:
+                        last_control_time = now
+                        settle_until = now + MOTION_SETTLE_SECONDS
+                        angle_buffer.clear()
+                        persistent_offset_frames = 0
                         if angle_diff > ROTATING_STATUS_THRESHOLD_DEG:
                             status_color = (0, 255, 0)
                             status_text = "CORRECTING"
@@ -456,6 +513,9 @@ def main():
             else:
                 stable_frame_count = 0
                 angle_buffer.clear()
+                persistent_offset_frames = 0
+                persistent_offset_sign = 0
+                settle_until = 0.0
                 reset_wrist_history(gesture_state)
                 if (
                     turret_state == STATE_ARMED
