@@ -11,12 +11,12 @@ SMOOTHING_WINDOW = max(1, int(os.environ.get("SMOOTHING_WINDOW", "6")))
 HFOV = float(os.environ.get("HFOV", "88.0"))
 RAW_TARGET_BLEND = min(max(float(os.environ.get("RAW_TARGET_BLEND", "0.35")), 0.0), 1.0)
 STARTUP_MOTOR_HOLD_SECONDS = max(
-    float(os.environ.get("STARTUP_MOTOR_HOLD_SECONDS", "1.0")),
+    float(os.environ.get("STARTUP_MOTOR_HOLD_SECONDS", "0.35")),
     0.0,
 )
-TARGET_ACQUIRE_FRAMES = max(1, int(os.environ.get("TARGET_ACQUIRE_FRAMES", "5")))
+TARGET_ACQUIRE_FRAMES = max(1, int(os.environ.get("TARGET_ACQUIRE_FRAMES", "2")))
 HIP_VISIBILITY_MIN = min(
-    max(float(os.environ.get("HIP_VISIBILITY_MIN", "0.65")), 0.0),
+    max(float(os.environ.get("HIP_VISIBILITY_MIN", "0.35")), 0.0),
     1.0,
 )
 
@@ -99,6 +99,7 @@ class MotorController:
         self.mode = mode
         self.direction_sign = MOTOR_DIRECTION_SIGN
         self.current_angle = 0.0
+        self.target_angle = 0.0
         self.last_output_angle = 9999.0
         self.servo_smooth = None
         self.gpio = None
@@ -118,6 +119,7 @@ class MotorController:
                 )
                 physical_angle = self._servo_to_turret(self.servo_smooth.current_angle)
                 self.current_angle = self._from_physical_turret(physical_angle)
+                self.target_angle = self.current_angle
                 self.last_output_angle = self.current_angle
                 self.mode = "servo_smooth"
                 print(
@@ -153,6 +155,7 @@ class MotorController:
                 f"MOTOR MODE: sim (direction="
                 f"{'reverse' if self.direction_sign < 0 else 'normal'})"
             )
+            self.target_angle = self.current_angle
 
     def _angle_to_duty(self, angle):
         normalized = (angle - MOTOR_MIN_ANGLE) / (MOTOR_MAX_ANGLE - MOTOR_MIN_ANGLE)
@@ -190,20 +193,30 @@ class MotorController:
         )
         self.last_output_angle = angle
 
-    def move_towards(self, target_angle, dt):
-        target_angle = clamp(target_angle, MOTOR_MIN_ANGLE, MOTOR_MAX_ANGLE)
-        max_step = MOTOR_MAX_SPEED_DPS * dt
+    def set_target(self, target_angle):
+        self.target_angle = clamp(target_angle, MOTOR_MIN_ANGLE, MOTOR_MAX_ANGLE)
 
-        if target_angle > self.current_angle:
-            next_angle = min(self.current_angle + max_step, target_angle)
+    def remaining_error(self):
+        return abs(self.target_angle - self.current_angle)
+
+    def update(self, dt):
+        max_step = MOTOR_MAX_SPEED_DPS * max(dt, 1e-4)
+
+        if self.target_angle > self.current_angle:
+            next_angle = min(self.current_angle + max_step, self.target_angle)
         else:
-            next_angle = max(self.current_angle - max_step, target_angle)
+            next_angle = max(self.current_angle - max_step, self.target_angle)
 
         next_angle = clamp(next_angle, MOTOR_MIN_ANGLE, MOTOR_MAX_ANGLE)
         moved = abs(next_angle - self.current_angle) > 1e-6
         self.current_angle = next_angle
-        self._emit_command(self.current_angle)
+        if moved:
+            self._emit_command(self.current_angle)
         return moved
+
+    def move_towards(self, target_angle, dt):
+        self.set_target(target_angle)
+        return self.update(dt)
 
     def cleanup(self):
         if self.servo_smooth is not None:
@@ -298,6 +311,7 @@ def main():
     persistent_offset_frames = 0
     persistent_offset_sign = 0
     target_visible_frames = 0
+    last_tracking_gate_state = None
     turret_state = STATE_TRACKING
     armed_start_time = 0.0
     first_strike_time = 0.0
@@ -378,10 +392,12 @@ def main():
 
             status_color = (0, 0, 255)
             status_text = "NO TARGET"
+            tracking_gate_state = "NO_TARGET"
             target_angle = None
             in_safe_zone = False
             wrist_velocity = 0.0
             active_wrist = "-"
+            motor_moved = False
 
             if results.pose_landmarks:
                 mp_drawing.draw_landmarks(
@@ -421,19 +437,24 @@ def main():
 
                 if not tracking_ready:
                     angle_buffer.clear()
-                    target_angle = motor.current_angle
+                    motor.set_target(motor.current_angle)
+                    target_angle = motor.target_angle
                     angle_diff = 0.0
                     correction_angle = 0.0
                     if now < startup_hold_until:
                         status_text = "STARTUP HOLD"
+                        tracking_gate_state = "STARTUP_HOLD"
                     elif hips_visible:
                         status_text = "ACQUIRING"
+                        tracking_gate_state = "ACQUIRING"
                     else:
                         status_text = "LOW CONFIDENCE"
+                        tracking_gate_state = "LOW_CONFIDENCE"
                 elif now < settle_until:
                     angle_buffer.clear()
-                    target_angle = motor.current_angle
-                    angle_diff = 0.0
+                    target_angle = motor.target_angle
+                    angle_diff = motor.remaining_error()
+                    tracking_gate_state = "SETTLING"
                 else:
                     angle_buffer.append(raw_offset_angle)
                     smoothed_offset_angle = sum(angle_buffer) / len(angle_buffer)
@@ -465,14 +486,23 @@ def main():
                             -MAX_CORRECTION_STEP_DEG,
                             MAX_CORRECTION_STEP_DEG,
                         )
+                        motor.set_target(
+                            clamp(
+                                motor.current_angle + correction_angle,
+                                MOTOR_MIN_ANGLE,
+                                MOTOR_MAX_ANGLE,
+                            )
+                        )
+                        last_control_time = now
+                        settle_until = now + MOTION_SETTLE_SECONDS
+                        angle_buffer.clear()
+                        persistent_offset_frames = 0
 
-                    target_angle = clamp(
-                        motor.current_angle + correction_angle,
-                        MOTOR_MIN_ANGLE,
-                        MOTOR_MAX_ANGLE,
-                    )
-                    angle_diff = abs(target_angle - motor.current_angle)
+                    target_angle = motor.target_angle
+                    angle_diff = motor.remaining_error()
+                    tracking_gate_state = "TRACKING"
 
+                motor_moved = motor.update(dt)
                 status_color = (0, 255, 255)
                 if not tracking_ready:
                     status_color = (0, 215, 255)
@@ -482,20 +512,13 @@ def main():
                     status_text = "CENTERED"
                 else:
                     status_text = "HOLDING"
-                if angle_diff > TRACKING_DEADBAND_DEG:
-                    control_dt = max(now - last_control_time, CONTROL_UPDATE_INTERVAL_SECONDS)
-                    moved = motor.move_towards(target_angle, control_dt)
-                    if moved:
-                        last_control_time = now
-                        settle_until = now + MOTION_SETTLE_SECONDS
-                        angle_buffer.clear()
-                        persistent_offset_frames = 0
-                        if angle_diff > ROTATING_STATUS_THRESHOLD_DEG:
-                            status_color = (0, 255, 0)
-                            status_text = "CORRECTING"
-                        else:
-                            status_color = (120, 255, 120)
-                            status_text = "FINE TRACK"
+                if motor_moved:
+                    if motor.remaining_error() > ROTATING_STATUS_THRESHOLD_DEG:
+                        status_color = (0, 255, 0)
+                        status_text = "CORRECTING"
+                    else:
+                        status_color = (120, 255, 120)
+                        status_text = "FINE TRACK"
 
                 lock_error = abs(blended_offset_angle)
                 if lock_error <= AIM_LOCK_TOLERANCE_DEG:
@@ -563,6 +586,7 @@ def main():
                 persistent_offset_sign = 0
                 target_visible_frames = 0
                 settle_until = 0.0
+                motor.set_target(motor.current_angle)
                 reset_wrist_history(gesture_state)
                 if (
                     turret_state == STATE_ARMED
@@ -570,6 +594,10 @@ def main():
                 ):
                     turret_state = STATE_TRACKING
                     last_gate_reason = "ARM_TIMEOUT_NO_TARGET"
+
+            if tracking_gate_state != last_tracking_gate_state:
+                print(f">>> TRACKING GATE: {tracking_gate_state}")
+                last_tracking_gate_state = tracking_gate_state
 
             mode_label = turret_state
             mode_color = (220, 220, 220)
