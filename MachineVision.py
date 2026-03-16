@@ -315,6 +315,14 @@ def fire_gate_ok(now, last_fire_time, fire_history, stable_frames, in_safe_zone)
     return True, "READY"
 
 
+def target_locked(person_detected, offset_angle, in_safe_zone):
+    return (
+        person_detected
+        and in_safe_zone
+        and abs(offset_angle) <= AIM_LOCK_TOLERANCE_DEG
+    )
+
+
 def get_search_bounds():
     sweep_min = clamp(
         min(SEARCH_SWEEP_MIN_ANGLE, SEARCH_SWEEP_MAX_ANGLE),
@@ -482,6 +490,7 @@ def main():
             person_detected = False
             person_center_x = None
             offset_angle = 0.0
+            target_is_locked = False
             correction_angle = 0.0
             tracking_ready = False
 
@@ -499,6 +508,9 @@ def main():
                     in_safe_zone = safe_left <= person_center_x <= safe_right
                     pixel_offset = person_center_x - center_x
                     offset_angle = pixel_offset_to_angle_deg(pixel_offset, w)
+                    target_is_locked = target_locked(
+                        person_detected, offset_angle, in_safe_zone
+                    )
                     if abs(offset_angle) <= AIM_LOCK_TOLERANCE_DEG:
                         stable_frame_count += 1
                     else:
@@ -636,6 +648,27 @@ def main():
                         status_color = (0, 255, 255)
                         status_text = "CENTERED" if correction_angle == 0.0 else "HOLDING"
                         vision_state = "TRACKING"
+
+                    if target_is_locked:
+                        presence_check_due = now + PRESENCE_RECHECK_SECONDS
+                    elif tracking_ready and now >= presence_check_due:
+                        searching = True
+                        stable_frame_count = 0
+                        detected_target_frames = 0
+                        angle_buffer.clear()
+                        persistent_offset_frames = 0
+                        persistent_offset_sign = 0
+                        settle_until = 0.0
+                        search_direction = begin_search_sweep(
+                            motor, sweep_min_angle, sweep_max_angle
+                        )
+                        target_angle = motor.target_angle
+                        status_color = (0, 165, 255)
+                        status_text = "REACQUIRE"
+                        vision_state = "REACQUIRE"
+                        print(
+                            ">>> SEARCH: target stayed off-lock until recheck, restarting sweep"
+                        )
                 else:
                     angle_buffer.clear()
                     persistent_offset_frames = 0
