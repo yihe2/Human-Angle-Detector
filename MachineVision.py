@@ -1,4 +1,5 @@
 import os
+import math
 import time
 from collections import deque
 
@@ -17,6 +18,27 @@ STARTUP_MOTOR_HOLD_SECONDS = max(
 TARGET_ACQUIRE_FRAMES = max(1, int(os.environ.get("TARGET_ACQUIRE_FRAMES", "2")))
 HIP_VISIBILITY_MIN = min(
     max(float(os.environ.get("HIP_VISIBILITY_MIN", "0.35")), 0.0),
+    1.0,
+)
+PRESENCE_RECHECK_SECONDS = max(
+    float(os.environ.get("PRESENCE_RECHECK_SECONDS", "20.0")),
+    0.5,
+)
+SEARCH_SWEEP_MIN_ANGLE = float(
+    os.environ.get("SEARCH_SWEEP_MIN_ANGLE", "-90.0")
+)
+SEARCH_SWEEP_MAX_ANGLE = float(
+    os.environ.get("SEARCH_SWEEP_MAX_ANGLE", "90.0")
+)
+SEARCH_ENDPOINT_TOLERANCE_DEG = max(
+    float(os.environ.get("SEARCH_ENDPOINT_TOLERANCE_DEG", "1.2")),
+    0.2,
+)
+SEARCH_TARGET_CONFIRM_FRAMES = max(
+    1, int(os.environ.get("SEARCH_TARGET_CONFIRM_FRAMES", "3"))
+)
+TORSO_VISIBILITY_MIN = min(
+    max(float(os.environ.get("TORSO_VISIBILITY_MIN", "0.55")), 0.0),
     1.0,
 )
 
@@ -293,6 +315,65 @@ def fire_gate_ok(now, last_fire_time, fire_history, stable_frames, in_safe_zone)
     return True, "READY"
 
 
+def get_search_bounds():
+    sweep_min = clamp(
+        min(SEARCH_SWEEP_MIN_ANGLE, SEARCH_SWEEP_MAX_ANGLE),
+        MOTOR_MIN_ANGLE,
+        MOTOR_MAX_ANGLE,
+    )
+    sweep_max = clamp(
+        max(SEARCH_SWEEP_MIN_ANGLE, SEARCH_SWEEP_MAX_ANGLE),
+        MOTOR_MIN_ANGLE,
+        MOTOR_MAX_ANGLE,
+    )
+    if sweep_max - sweep_min < max(SEARCH_ENDPOINT_TOLERANCE_DEG * 2.0, 5.0):
+        return MOTOR_MIN_ANGLE, MOTOR_MAX_ANGLE
+    return sweep_min, sweep_max
+
+
+def pixel_offset_to_angle_deg(pixel_offset, frame_width):
+    if frame_width <= 0:
+        return 0.0
+
+    focal_pixels = (frame_width / 2.0) / max(math.tan(math.radians(HFOV / 2.0)), 1e-6)
+    return math.degrees(math.atan2(pixel_offset, focal_pixels))
+
+
+def get_torso_center_x(landmarks, pose_module, frame_width):
+    landmark_specs = (
+        (pose_module.PoseLandmark.LEFT_SHOULDER, 1.4),
+        (pose_module.PoseLandmark.RIGHT_SHOULDER, 1.4),
+        (pose_module.PoseLandmark.LEFT_HIP, 1.0),
+        (pose_module.PoseLandmark.RIGHT_HIP, 1.0),
+    )
+    weighted_x = 0.0
+    total_weight = 0.0
+    visible_points = 0
+
+    for landmark_enum, base_weight in landmark_specs:
+        landmark = landmarks[landmark_enum.value]
+        if landmark.visibility < TORSO_VISIBILITY_MIN:
+            continue
+
+        weight = base_weight * (landmark.visibility ** 2)
+        weighted_x += landmark.x * frame_width * weight
+        total_weight += weight
+        visible_points += 1
+
+    if visible_points < 2 or total_weight <= 0.0:
+        return None
+
+    return int(weighted_x / total_weight)
+
+
+def begin_search_sweep(motor, sweep_min_angle, sweep_max_angle):
+    midpoint = (sweep_min_angle + sweep_max_angle) / 2.0
+    search_direction = 1 if motor.current_angle <= midpoint else -1
+    next_target = sweep_max_angle if search_direction > 0 else sweep_min_angle
+    motor.set_target(next_target)
+    return search_direction
+
+
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
@@ -303,15 +384,12 @@ def main():
     camera_started = False
     headless = os.environ.get("HEADLESS", "0") == "1" or not os.environ.get("DISPLAY")
 
-    angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
     last_frame_time = time.monotonic()
-    last_control_time = last_frame_time
-    startup_hold_until = last_frame_time + STARTUP_MOTOR_HOLD_SECONDS
-    settle_until = 0.0
-    persistent_offset_frames = 0
-    persistent_offset_sign = 0
-    target_visible_frames = 0
-    last_tracking_gate_state = None
+    presence_check_due = last_frame_time
+    last_vision_state = None
+    search_direction = 1
+    searching = False
+    detected_target_frames = 0
     turret_state = STATE_TRACKING
     armed_start_time = 0.0
     first_strike_time = 0.0
@@ -335,6 +413,7 @@ def main():
             min_tracking_confidence=0.5,
         )
         motor = MotorController(MOTOR_CONTROL_MODE)
+        sweep_min_angle, sweep_max_angle = get_search_bounds()
 
         picam2 = Picamera2()
         config = picam2.create_preview_configuration(
@@ -345,19 +424,14 @@ def main():
         camera_started = True
 
         print("---------------------------------------")
-        print("  FREE TURRET TRACKING SYSTEM STARTED  ")
-        print(f"  Smoothing: {SMOOTHING_WINDOW} frames")
-        print(f"  Startup hold:       {STARTUP_MOTOR_HOLD_SECONDS:.2f}s")
-        print(f"  Acquire frames:     {TARGET_ACQUIRE_FRAMES}")
-        print(f"  Raw target blend:   {RAW_TARGET_BLEND:.2f}")
-        print(f"  Response gain:      {TRACKING_RESPONSE_GAIN:.2f}")
-        print(f"  Correction sign:    {TRACKING_CORRECTION_SIGN:+.0f}")
-        print(f"  Tracking deadband: {TRACKING_DEADBAND_DEG:.2f} degrees")
-        print(f"  Center hold tol:   {CENTER_HOLD_TOLERANCE_DEG:.2f} degrees")
-        print(f"  Control interval:  {CONTROL_UPDATE_INTERVAL_SECONDS:.2f}s")
-        print(f"  Motion settle:     {MOTION_SETTLE_SECONDS:.2f}s")
-        print(f"  Max correction:    {MAX_CORRECTION_STEP_DEG:.2f} degrees")
+        print("  PERIODIC SEARCH TURRET SYSTEM STARTED ")
+        print(f"  Presence check:    {PRESENCE_RECHECK_SECONDS:.1f}s")
+        print(
+            f"  Sweep range:       {sweep_min_angle:.0f} to {sweep_max_angle:.0f} deg"
+        )
+        print(f"  Acquire frames:    {SEARCH_TARGET_CONFIRM_FRAMES}")
         print(f"  Lock tolerance:    {AIM_LOCK_TOLERANCE_DEG:.2f} degrees")
+        print(f"  Torso vis min:     {TORSO_VISIBILITY_MIN:.2f}")
         print(f"  Trigger:   Double down-stroke")
         print(f"  Motor:     {motor.mode}")
         print("---------------------------------------")
@@ -391,13 +465,17 @@ def main():
             cv2.line(image, (safe_right, 0), (safe_right, h), (255, 120, 0), 1)
 
             status_color = (0, 0, 255)
-            status_text = "NO TARGET"
-            tracking_gate_state = "NO_TARGET"
-            target_angle = None
+            status_text = "NO PERSON"
+            vision_state = "CHECKING"
+            target_angle = motor.target_angle
             in_safe_zone = False
             wrist_velocity = 0.0
             active_wrist = "-"
             motor_moved = False
+            downstroke = False
+            person_detected = False
+            person_center_x = None
+            offset_angle = 0.0
 
             if results.pose_landmarks:
                 mp_drawing.draw_landmarks(
@@ -405,131 +483,102 @@ def main():
                 )
 
                 landmarks = results.pose_landmarks.landmark
-                left_hip_landmark = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
-                right_hip_landmark = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
-                hips_visible = (
-                    left_hip_landmark.visibility >= HIP_VISIBILITY_MIN
-                    and right_hip_landmark.visibility >= HIP_VISIBILITY_MIN
-                )
-                if hips_visible:
-                    target_visible_frames += 1
+                person_center_x = get_torso_center_x(landmarks, mp_pose, w)
+                person_detected = person_center_x is not None
+
+                if person_detected:
+                    detected_target_frames += 1
+                    in_safe_zone = safe_left <= person_center_x <= safe_right
+                    pixel_offset = person_center_x - center_x
+                    offset_angle = pixel_offset_to_angle_deg(pixel_offset, w)
+                    if abs(offset_angle) <= AIM_LOCK_TOLERANCE_DEG:
+                        stable_frame_count += 1
+                    else:
+                        stable_frame_count = 0
+
+                    if not searching:
+                        downstroke, wrist_velocity, active_wrist = detect_downstroke(
+                            landmarks, now, gesture_state, mp_pose
+                        )
+
+                    person_line_color = (0, 220, 0) if in_safe_zone else (0, 0, 255)
+                    cv2.line(
+                        image,
+                        (person_center_x, 0),
+                        (person_center_x, h),
+                        person_line_color,
+                        2,
+                    )
                 else:
-                    target_visible_frames = 0
-                    angle_buffer.clear()
-                    persistent_offset_frames = 0
-                    persistent_offset_sign = 0
+                    detected_target_frames = 0
+                    stable_frame_count = 0
+                    reset_wrist_history(gesture_state)
+            else:
+                stable_frame_count = 0
+                detected_target_frames = 0
+                reset_wrist_history(gesture_state)
 
-                left_hip = left_hip_landmark.x * w
-                right_hip = right_hip_landmark.x * w
-                person_center_x = int((left_hip + right_hip) / 2)
-
-                in_safe_zone = safe_left <= person_center_x <= safe_right
-                pixel_offset = person_center_x - center_x
-                raw_offset_angle = (pixel_offset / w) * HFOV
-                correction_angle = 0.0
-                blended_offset_angle = raw_offset_angle
-
-                tracking_ready = (
-                    hips_visible
-                    and target_visible_frames >= TARGET_ACQUIRE_FRAMES
-                    and now >= startup_hold_until
-                )
-
-                if not tracking_ready:
-                    angle_buffer.clear()
+            if searching:
+                vision_state = "SEARCHING"
+                if (
+                    person_detected
+                    and detected_target_frames >= SEARCH_TARGET_CONFIRM_FRAMES
+                ):
+                    searching = False
                     motor.set_target(motor.current_angle)
                     target_angle = motor.target_angle
-                    angle_diff = 0.0
-                    correction_angle = 0.0
-                    if now < startup_hold_until:
-                        status_text = "STARTUP HOLD"
-                        tracking_gate_state = "STARTUP_HOLD"
-                    elif hips_visible:
-                        status_text = "ACQUIRING"
-                        tracking_gate_state = "ACQUIRING"
-                    else:
-                        status_text = "LOW CONFIDENCE"
-                        tracking_gate_state = "LOW_CONFIDENCE"
-                elif now < settle_until:
-                    angle_buffer.clear()
-                    target_angle = motor.target_angle
-                    angle_diff = motor.remaining_error()
-                    tracking_gate_state = "SETTLING"
+                    presence_check_due = now + PRESENCE_RECHECK_SECONDS
+                    status_color = (0, 255, 0)
+                    status_text = "TARGET FOUND"
+                    vision_state = "TARGET_FOUND"
+                    print(">>> SEARCH: target acquired, holding current angle")
                 else:
-                    angle_buffer.append(raw_offset_angle)
-                    smoothed_offset_angle = sum(angle_buffer) / len(angle_buffer)
-                    blended_offset_angle = (
-                        RAW_TARGET_BLEND * raw_offset_angle
-                        + (1.0 - RAW_TARGET_BLEND) * smoothed_offset_angle
-                    )
-
-                    if abs(blended_offset_angle) <= CENTER_HOLD_TOLERANCE_DEG:
-                        persistent_offset_frames = 0
-                        persistent_offset_sign = 0
-                    else:
-                        offset_sign = 1 if blended_offset_angle > 0 else -1
-                        if offset_sign == persistent_offset_sign:
-                            persistent_offset_frames += 1
+                    if motor.remaining_error() <= SEARCH_ENDPOINT_TOLERANCE_DEG:
+                        if abs(motor.target_angle - sweep_max_angle) <= SEARCH_ENDPOINT_TOLERANCE_DEG:
+                            search_direction = -1
+                            motor.set_target(sweep_min_angle)
                         else:
-                            persistent_offset_sign = offset_sign
-                            persistent_offset_frames = 1
-
-                    if (
-                        abs(blended_offset_angle) > CENTER_HOLD_TOLERANCE_DEG
-                        and persistent_offset_frames >= OFFSET_PERSISTENCE_FRAMES
-                        and now - last_control_time >= CONTROL_UPDATE_INTERVAL_SECONDS
-                    ):
-                        correction_angle = clamp(
-                            blended_offset_angle
-                            * TRACKING_RESPONSE_GAIN
-                            * TRACKING_CORRECTION_SIGN,
-                            -MAX_CORRECTION_STEP_DEG,
-                            MAX_CORRECTION_STEP_DEG,
-                        )
-                        motor.set_target(
-                            clamp(
-                                motor.current_angle + correction_angle,
-                                MOTOR_MIN_ANGLE,
-                                MOTOR_MAX_ANGLE,
-                            )
-                        )
-                        last_control_time = now
-                        settle_until = now + MOTION_SETTLE_SECONDS
-                        angle_buffer.clear()
-                        persistent_offset_frames = 0
+                            search_direction = 1
+                            motor.set_target(sweep_max_angle)
+                        print(f">>> SEARCH: sweeping to {motor.target_angle:.1f} deg")
 
                     target_angle = motor.target_angle
-                    angle_diff = motor.remaining_error()
-                    tracking_gate_state = "TRACKING"
-
-                motor_moved = motor.update(dt)
-                status_color = (0, 255, 255)
-                if not tracking_ready:
-                    status_color = (0, 215, 255)
-                elif now < settle_until:
-                    status_text = "SETTLING"
-                elif correction_angle == 0.0:
-                    status_text = "CENTERED"
-                else:
-                    status_text = "HOLDING"
-                if motor_moved:
-                    if motor.remaining_error() > ROTATING_STATUS_THRESHOLD_DEG:
-                        status_color = (0, 255, 0)
-                        status_text = "CORRECTING"
+                    status_color = (0, 165, 255)
+                    status_text = (
+                        f"SWEEP {'RIGHT' if search_direction > 0 else 'LEFT'}"
+                    )
+            else:
+                motor.set_target(motor.current_angle)
+                target_angle = motor.target_angle
+                next_check_left = max(0.0, presence_check_due - now)
+                if now >= presence_check_due:
+                    if person_detected:
+                        presence_check_due = now + PRESENCE_RECHECK_SECONDS
+                        status_color = (0, 255, 255)
+                        status_text = "TARGET PRESENT"
+                        vision_state = "TARGET_PRESENT"
                     else:
-                        status_color = (120, 255, 120)
-                        status_text = "FINE TRACK"
-
-                lock_error = abs(blended_offset_angle)
-                if lock_error <= AIM_LOCK_TOLERANCE_DEG:
-                    stable_frame_count += 1
+                        searching = True
+                        stable_frame_count = 0
+                        detected_target_frames = 0
+                        search_direction = begin_search_sweep(
+                            motor, sweep_min_angle, sweep_max_angle
+                        )
+                        target_angle = motor.target_angle
+                        status_color = (0, 165, 255)
+                        status_text = "SEARCH START"
+                        vision_state = "SEARCH_START"
+                        print(
+                            ">>> SEARCH: no target at scheduled check, starting sweep"
+                        )
                 else:
-                    stable_frame_count = 0
+                    status_color = (0, 215, 255) if person_detected else (0, 140, 255)
+                    status_text = f"HOLD {next_check_left:.1f}s"
+                    vision_state = "WAITING_CHECK"
 
-                downstroke, wrist_velocity, active_wrist = detect_downstroke(
-                    landmarks, now, gesture_state, mp_pose
-                )
+            motor_moved = motor.update(dt)
 
+            if person_detected and not searching:
                 if turret_state == STATE_TRACKING:
                     if downstroke:
                         turret_state = STATE_ARMED
@@ -560,44 +609,26 @@ def main():
                             else:
                                 turret_state = STATE_TRACKING
                                 print(f">>> FIRE BLOCKED: {gate_reason}")
+            elif (
+                turret_state == STATE_ARMED
+                and now - armed_start_time > ARMED_TIMEOUT_SECONDS
+            ):
+                turret_state = STATE_TRACKING
+                last_gate_reason = "ARM_TIMEOUT_NO_TARGET"
 
-                if turret_state == STATE_FIRE:
-                    print(
-                        f">>> FIRE COMMAND: Launch puck at {motor.current_angle:.1f} deg"
-                    )
-                    last_fire_time = now
-                    fire_history.append(now)
-                    fire_flash_until = now + FIRE_FLASH_SECONDS
-                    turret_state = STATE_TRACKING
-                    last_gate_reason = "FIRED"
-
-                person_line_color = status_color if in_safe_zone else (0, 0, 255)
-                cv2.line(
-                    image,
-                    (person_center_x, 0),
-                    (person_center_x, h),
-                    person_line_color,
-                    2,
+            if turret_state == STATE_FIRE:
+                print(
+                    f">>> FIRE COMMAND: Launch puck at {motor.current_angle:.1f} deg"
                 )
-            else:
-                stable_frame_count = 0
-                angle_buffer.clear()
-                persistent_offset_frames = 0
-                persistent_offset_sign = 0
-                target_visible_frames = 0
-                settle_until = 0.0
-                motor.set_target(motor.current_angle)
-                reset_wrist_history(gesture_state)
-                if (
-                    turret_state == STATE_ARMED
-                    and now - armed_start_time > ARMED_TIMEOUT_SECONDS
-                ):
-                    turret_state = STATE_TRACKING
-                    last_gate_reason = "ARM_TIMEOUT_NO_TARGET"
+                last_fire_time = now
+                fire_history.append(now)
+                fire_flash_until = now + FIRE_FLASH_SECONDS
+                turret_state = STATE_TRACKING
+                last_gate_reason = "FIRED"
 
-            if tracking_gate_state != last_tracking_gate_state:
-                print(f">>> TRACKING GATE: {tracking_gate_state}")
-                last_tracking_gate_state = tracking_gate_state
+            if vision_state != last_vision_state:
+                print(f">>> VISION STATE: {vision_state}")
+                last_vision_state = vision_state
 
             mode_label = turret_state
             mode_color = (220, 220, 220)
@@ -608,10 +639,11 @@ def main():
                 mode_color = (0, 0, 255)
 
             cooldown_left = max(0.0, FIRE_COOLDOWN_SECONDS - (now - last_fire_time))
+            next_check_left = 0.0 if searching else max(0.0, presence_check_due - now)
 
             cv2.putText(
                 image,
-                f"Track: {status_text}",
+                f"Vision: {status_text}",
                 (10, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -630,7 +662,7 @@ def main():
             if target_angle is not None:
                 cv2.putText(
                     image,
-                    f"Target/Locked: {target_angle:.1f} / {motor.current_angle:.1f}",
+                    f"Sweep/Hold: {target_angle:.1f} / {motor.current_angle:.1f}",
                     (10, 82),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -658,10 +690,7 @@ def main():
             )
             cv2.putText(
                 image,
-                (
-                    f"Cooldown: {cooldown_left:.1f}s  Rate: "
-                    f"{len(fire_history)}/{MAX_FIRES_PER_MINUTE} per min"
-                ),
+                f"Next Check: {next_check_left:.1f}s  Search: {sweep_min_angle:.0f}->{sweep_max_angle:.0f}",
                 (10, 134),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -670,7 +699,10 @@ def main():
             )
             cv2.putText(
                 image,
-                f"Wrist {active_wrist} Vy: {wrist_velocity:.2f}  Gate: {last_gate_reason}",
+                (
+                    f"Cooldown: {cooldown_left:.1f}s  Rate: "
+                    f"{len(fire_history)}/{MAX_FIRES_PER_MINUTE} per min"
+                ),
                 (10, 160),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -679,8 +711,17 @@ def main():
             )
             cv2.putText(
                 image,
-                f"Safe Zone: {'OK' if in_safe_zone else 'BLOCKED'}",
+                f"Wrist {active_wrist} Vy: {wrist_velocity:.2f}  Gate: {last_gate_reason}",
                 (10, 186),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (180, 180, 180),
+                1,
+            )
+            cv2.putText(
+                image,
+                f"Safe Zone: {'OK' if in_safe_zone else 'BLOCKED'}  Offset: {offset_angle:.1f} deg",
+                (10, 212),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (0, 220, 0) if in_safe_zone else (0, 0, 255),
