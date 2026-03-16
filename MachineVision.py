@@ -384,7 +384,13 @@ def main():
     camera_started = False
     headless = os.environ.get("HEADLESS", "0") == "1" or not os.environ.get("DISPLAY")
 
+    angle_buffer = deque(maxlen=SMOOTHING_WINDOW)
     last_frame_time = time.monotonic()
+    last_control_time = last_frame_time
+    startup_hold_until = last_frame_time + STARTUP_MOTOR_HOLD_SECONDS
+    settle_until = 0.0
+    persistent_offset_frames = 0
+    persistent_offset_sign = 0
     presence_check_due = last_frame_time
     last_vision_state = None
     search_direction = 1
@@ -476,6 +482,8 @@ def main():
             person_detected = False
             person_center_x = None
             offset_angle = 0.0
+            correction_angle = 0.0
+            tracking_ready = False
 
             if results.pose_landmarks:
                 mp_drawing.draw_landmarks(
@@ -525,16 +533,22 @@ def main():
                     and detected_target_frames >= SEARCH_TARGET_CONFIRM_FRAMES
                 ):
                     searching = False
-                    motor.set_target(motor.current_angle)
-                    target_angle = motor.target_angle
+                    angle_buffer.clear()
+                    persistent_offset_frames = 0
+                    persistent_offset_sign = 0
+                    last_control_time = now
+                    settle_until = 0.0
                     presence_check_due = now + PRESENCE_RECHECK_SECONDS
                     status_color = (0, 255, 0)
                     status_text = "TARGET FOUND"
                     vision_state = "TARGET_FOUND"
-                    print(">>> SEARCH: target acquired, holding current angle")
+                    print(">>> SEARCH: target acquired, switching to centering")
                 else:
                     if motor.remaining_error() <= SEARCH_ENDPOINT_TOLERANCE_DEG:
-                        if abs(motor.target_angle - sweep_max_angle) <= SEARCH_ENDPOINT_TOLERANCE_DEG:
+                        if (
+                            abs(motor.target_angle - sweep_max_angle)
+                            <= SEARCH_ENDPOINT_TOLERANCE_DEG
+                        ):
                             search_direction = -1
                             motor.set_target(sweep_min_angle)
                         else:
@@ -547,17 +561,90 @@ def main():
                     status_text = (
                         f"SWEEP {'RIGHT' if search_direction > 0 else 'LEFT'}"
                     )
-            else:
-                motor.set_target(motor.current_angle)
-                target_angle = motor.target_angle
-                next_check_left = max(0.0, presence_check_due - now)
-                if now >= presence_check_due:
-                    if person_detected:
-                        presence_check_due = now + PRESENCE_RECHECK_SECONDS
-                        status_color = (0, 255, 255)
-                        status_text = "TARGET PRESENT"
-                        vision_state = "TARGET_PRESENT"
+
+            if not searching:
+                if person_detected:
+                    tracking_ready = (
+                        detected_target_frames >= TARGET_ACQUIRE_FRAMES
+                        and now >= startup_hold_until
+                    )
+
+                    if not tracking_ready:
+                        angle_buffer.clear()
+                        persistent_offset_frames = 0
+                        persistent_offset_sign = 0
+                        motor.set_target(motor.current_angle)
+                        target_angle = motor.target_angle
+                        status_color = (0, 215, 255)
+                        if now < startup_hold_until:
+                            status_text = "STARTUP HOLD"
+                            vision_state = "STARTUP_HOLD"
+                        else:
+                            status_text = "ACQUIRING"
+                            vision_state = "ACQUIRING"
+                    elif now < settle_until:
+                        angle_buffer.clear()
+                        target_angle = motor.target_angle
+                        status_color = (0, 215, 255)
+                        status_text = "SETTLING"
+                        vision_state = "SETTLING"
                     else:
+                        angle_buffer.append(offset_angle)
+                        smoothed_offset_angle = sum(angle_buffer) / len(angle_buffer)
+                        blended_offset_angle = (
+                            RAW_TARGET_BLEND * offset_angle
+                            + (1.0 - RAW_TARGET_BLEND) * smoothed_offset_angle
+                        )
+
+                        if abs(blended_offset_angle) <= CENTER_HOLD_TOLERANCE_DEG:
+                            persistent_offset_frames = 0
+                            persistent_offset_sign = 0
+                        else:
+                            offset_sign = 1 if blended_offset_angle > 0 else -1
+                            if offset_sign == persistent_offset_sign:
+                                persistent_offset_frames += 1
+                            else:
+                                persistent_offset_sign = offset_sign
+                                persistent_offset_frames = 1
+
+                        if (
+                            abs(blended_offset_angle) > CENTER_HOLD_TOLERANCE_DEG
+                            and persistent_offset_frames >= OFFSET_PERSISTENCE_FRAMES
+                            and now - last_control_time
+                            >= CONTROL_UPDATE_INTERVAL_SECONDS
+                        ):
+                            correction_angle = clamp(
+                                blended_offset_angle
+                                * TRACKING_RESPONSE_GAIN
+                                * TRACKING_CORRECTION_SIGN,
+                                -MAX_CORRECTION_STEP_DEG,
+                                MAX_CORRECTION_STEP_DEG,
+                            )
+                            motor.set_target(
+                                clamp(
+                                    motor.current_angle + correction_angle,
+                                    MOTOR_MIN_ANGLE,
+                                    MOTOR_MAX_ANGLE,
+                                )
+                            )
+                            last_control_time = now
+                            settle_until = now + MOTION_SETTLE_SECONDS
+                            angle_buffer.clear()
+                            persistent_offset_frames = 0
+
+                        target_angle = motor.target_angle
+                        status_color = (0, 255, 255)
+                        status_text = "CENTERED" if correction_angle == 0.0 else "HOLDING"
+                        vision_state = "TRACKING"
+                else:
+                    angle_buffer.clear()
+                    persistent_offset_frames = 0
+                    persistent_offset_sign = 0
+                    settle_until = 0.0
+                    motor.set_target(motor.current_angle)
+                    target_angle = motor.target_angle
+                    next_check_left = max(0.0, presence_check_due - now)
+                    if now >= presence_check_due:
                         searching = True
                         stable_frame_count = 0
                         detected_target_frames = 0
@@ -571,12 +658,24 @@ def main():
                         print(
                             ">>> SEARCH: no target at scheduled check, starting sweep"
                         )
-                else:
-                    status_color = (0, 215, 255) if person_detected else (0, 140, 255)
-                    status_text = f"HOLD {next_check_left:.1f}s"
-                    vision_state = "WAITING_CHECK"
+                    else:
+                        status_color = (0, 140, 255)
+                        status_text = f"HOLD {next_check_left:.1f}s"
+                        vision_state = "WAITING_CHECK"
 
             motor_moved = motor.update(dt)
+
+            if person_detected and not searching and tracking_ready:
+                if now < settle_until:
+                    status_color = (0, 215, 255)
+                    status_text = "SETTLING"
+                elif motor_moved:
+                    if motor.remaining_error() > ROTATING_STATUS_THRESHOLD_DEG:
+                        status_color = (0, 255, 0)
+                        status_text = "CORRECTING"
+                    else:
+                        status_color = (120, 255, 120)
+                        status_text = "FINE TRACK"
 
             if person_detected and not searching:
                 if turret_state == STATE_TRACKING:
