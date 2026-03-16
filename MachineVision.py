@@ -349,16 +349,18 @@ def pixel_offset_to_angle_deg(pixel_offset, frame_width):
 
 def get_torso_center_x(landmarks, pose_module, frame_width):
     landmark_specs = (
-        (pose_module.PoseLandmark.LEFT_SHOULDER, 1.4),
-        (pose_module.PoseLandmark.RIGHT_SHOULDER, 1.4),
-        (pose_module.PoseLandmark.LEFT_HIP, 1.0),
-        (pose_module.PoseLandmark.RIGHT_HIP, 1.0),
+        ("left", "shoulder", pose_module.PoseLandmark.LEFT_SHOULDER, 1.4),
+        ("right", "shoulder", pose_module.PoseLandmark.RIGHT_SHOULDER, 1.4),
+        ("left", "hip", pose_module.PoseLandmark.LEFT_HIP, 1.0),
+        ("right", "hip", pose_module.PoseLandmark.RIGHT_HIP, 1.0),
     )
     weighted_x = 0.0
     total_weight = 0.0
     visible_points = 0
+    visible_sides = set()
+    visible_rows = {"shoulder": set(), "hip": set()}
 
-    for landmark_enum, base_weight in landmark_specs:
+    for side, row, landmark_enum, base_weight in landmark_specs:
         landmark = landmarks[landmark_enum.value]
         if landmark.visibility < TORSO_VISIBILITY_MIN:
             continue
@@ -367,8 +369,17 @@ def get_torso_center_x(landmarks, pose_module, frame_width):
         weighted_x += landmark.x * frame_width * weight
         total_weight += weight
         visible_points += 1
+        visible_sides.add(side)
+        visible_rows[row].add(side)
 
-    if visible_points < 2 or total_weight <= 0.0:
+    has_left_right_support = len(visible_sides) == 2
+    has_paired_row = any(len(row_sides) == 2 for row_sides in visible_rows.values())
+
+    if (
+        total_weight <= 0.0
+        or not has_left_right_support
+        or (visible_points < 3 and not has_paired_row)
+    ):
         return None
 
     return int(weighted_x / total_weight)
